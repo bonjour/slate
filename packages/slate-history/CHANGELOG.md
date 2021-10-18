@@ -1,5 +1,17 @@
 # slate-history
 
+## 0.66.0
+
+### Patch Changes
+
+- [#4500](https://github.com/ianstormtaylor/slate/pull/4500) [`50bb3d7e`](https://github.com/ianstormtaylor/slate/commit/50bb3d7e32d640957018831526235ca656963f1d) Thanks [@tubbo](https://github.com/tubbo)! - Upgrade `is-plain-object` to v5.0.0
+
+## 0.65.3
+
+### Patch Changes
+
+- [#4430](https://github.com/ianstormtaylor/slate/pull/4430) [`748bf750`](https://github.com/ianstormtaylor/slate/commit/748bf7500557507a999796749cef28b0d1eb79d9) Thanks [@TheSpyder](https://github.com/TheSpyder)! - Removed unnecessary (and outdated) dependency on `immer`
+
 ## 0.62.0
 
 ### Minor Changes

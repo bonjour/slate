@@ -6,11 +6,11 @@ import {
   ELEMENT_TO_NODE,
   IS_FOCUSED,
   IS_READ_ONLY,
-  KEY_TO_ELEMENT,
   NODE_TO_INDEX,
   NODE_TO_KEY,
   NODE_TO_PARENT,
   EDITOR_TO_WINDOW,
+  EDITOR_TO_KEY_TO_ELEMENT,
 } from '../utils/weak-maps'
 import {
   DOMElement,
@@ -24,7 +24,7 @@ import {
   normalizeDOMPoint,
   hasShadowRoot,
 } from '../utils/dom'
-import { IS_CHROME } from '../utils/environment'
+import { IS_CHROME, IS_FIREFOX } from '../utils/environment'
 
 /**
  * A React and DOM-specific version of the `Editor` interface.
@@ -106,23 +106,14 @@ export const ReactEditor = {
     const el = ReactEditor.toDOMNode(editor, editor)
     const root = el.getRootNode()
 
-    // The below exception will always be thrown for iframes because the document inside an iframe
-    // does not inherit it's prototype from the parent document, therefore we return early
-    if (el.ownerDocument !== document) return el.ownerDocument
+    if (
+      (root instanceof Document || root instanceof ShadowRoot) &&
+      root.getSelection != null
+    ) {
+      return root
+    }
 
-    if (!(root instanceof Document || root instanceof ShadowRoot))
-      throw new Error(
-        `Unable to find DocumentOrShadowRoot for editor element: ${el}`
-      )
-
-    // COMPAT: Only Chrome implements the DocumentOrShadowRoot mixin for
-    // ShadowRoot; other browsers still implement it on the Document
-    // interface. (2020/08/08)
-    // https://developer.mozilla.org/en-US/docs/Web/API/ShadowRoot#Properties
-    if (root.getSelection === undefined && el.ownerDocument !== null)
-      return el.ownerDocument
-
-    return root
+    return el.ownerDocument
   },
 
   /**
@@ -250,9 +241,10 @@ export const ReactEditor = {
    */
 
   toDOMNode(editor: ReactEditor, node: Node): HTMLElement {
+    const KEY_TO_ELEMENT = EDITOR_TO_KEY_TO_ELEMENT.get(editor)
     const domNode = Editor.isEditor(node)
       ? EDITOR_TO_ELEMENT.get(editor)
-      : KEY_TO_ELEMENT.get(ReactEditor.findKey(editor, node))
+      : KEY_TO_ELEMENT?.get(ReactEditor.findKey(editor, node))
 
     if (!domNode) {
       throw new Error(
@@ -449,9 +441,9 @@ export const ReactEditor = {
   toSlatePoint<T extends boolean>(
     editor: ReactEditor,
     domPoint: DOMPoint,
-    extractMatch: T
+    exactMatch: T
   ): T extends true ? Point | null : Point {
-    const [nearestNode, nearestOffset] = extractMatch
+    const [nearestNode, nearestOffset] = exactMatch
       ? domPoint
       : normalizeDOMPoint(domPoint)
     const parentNode = nearestNode.parentNode as DOMElement
@@ -471,6 +463,7 @@ export const ReactEditor = {
         const range = window.document.createRange()
         range.setStart(textNode, 0)
         range.setEnd(nearestNode, nearestOffset)
+
         const contents = range.cloneContents()
         const removals = [
           ...Array.prototype.slice.call(
@@ -510,22 +503,26 @@ export const ReactEditor = {
         }
       }
 
-      // COMPAT: If the parent node is a Slate zero-width space, editor is
-      // because the text node should have no characters. However, during IME
-      // composition the ASCII characters will be prepended to the zero-width
-      // space, so subtract 1 from the offset to account for the zero-width
-      // space character.
       if (
         domNode &&
         offset === domNode.textContent!.length &&
-        parentNode.hasAttribute('data-slate-zero-width')
+        // COMPAT: If the parent node is a Slate zero-width space, editor is
+        // because the text node should have no characters. However, during IME
+        // composition the ASCII characters will be prepended to the zero-width
+        // space, so subtract 1 from the offset to account for the zero-width
+        // space character.
+        (parentNode.hasAttribute('data-slate-zero-width') ||
+          // COMPAT: In Firefox, `range.cloneContents()` returns an extra trailing '\n'
+          // when the document ends with a new-line character. This results in the offset
+          // length being off by one, so we need to subtract one to account for this.
+          (IS_FIREFOX && domNode.textContent?.endsWith('\n\n')))
       ) {
         offset--
       }
     }
 
     if (!textNode) {
-      if (extractMatch) {
+      if (exactMatch) {
         return null as T extends true ? Point | null : Point
       }
       throw new Error(
@@ -568,6 +565,65 @@ export const ReactEditor = {
         anchorOffset = domRange.anchorOffset
         focusNode = domRange.focusNode
         focusOffset = domRange.focusOffset
+        // When triple clicking a block, Chrome will return a selection object whose
+        // focus node is the next element sibling and focusOffset is 0.
+        // This will highlight the corresponding toolbar button for the sibling
+        // block even though users just want to target the previous block.
+        // (2021/08/24)
+        // Signs of a triple click in Chrome
+        // - anchor node will be a text node but focus node won't
+        // - both anchorOffset and focusOffset are 0
+        // - focusNode value will be null since Chrome tries to extend to just the
+        // beginning of the next block
+        if (
+          IS_CHROME &&
+          anchorNode &&
+          focusNode &&
+          anchorNode.nodeType !== focusNode.nodeType &&
+          domRange.anchorOffset === 0 &&
+          domRange.focusOffset === 0 &&
+          focusNode.nodeValue == null
+        ) {
+          // If an anchorNode is an element node when triple clicked, then the focusNode
+          //  should also be the same as anchorNode when triple clicked.
+          // Otherwise, anchorNode is a text node and we need to
+          // - climb up the DOM tree to get the farthest element node that receives
+          //   triple click. It should have atribute 'data-slate-node' = "element"
+          // - get the last child of that element node
+          // - climb down the DOM tree to get the text node of the last child
+          // - this is also the end of the selection aka the focusNode
+          const anchorElement = anchorNode.parentNode as HTMLElement
+          const selectedBlock = anchorElement.closest(
+            '[data-slate-node="element"]'
+          )
+          if (selectedBlock) {
+            // The Slate Text nodes are leaf-level and contains document's text.
+            // However, when represented in the DOM, they are actually Element nodes
+            // and different from the DOM's Text nodes
+            const { childElementCount: slateTextNodeCount } = selectedBlock
+            if (slateTextNodeCount === 1) {
+              focusNode = anchorNode as Text
+              focusOffset = focusNode.length
+            } else if (slateTextNodeCount > 1) {
+              // A element with attribute data-slate-node="element" can have multiple
+              // children with attribute data-slate-node="text". But these children only have
+              // one child at each level.
+              // <span data-slate-node="text">
+              //   <span data-slate-leaf="">
+              //     <span data-slate-string=""></span>
+              //   </span>
+              // </span>
+              const focusElement = selectedBlock.lastElementChild as HTMLElement
+              const nodeIterator = document.createNodeIterator(
+                focusElement,
+                NodeFilter.SHOW_TEXT
+              )
+              focusNode = nodeIterator.nextNode() as Text
+              focusOffset = focusNode.length
+            }
+          }
+        }
+
         // COMPAT: There's a bug in chrome that always returns `true` for
         // `isCollapsed` for a Selection that comes from a ShadowRoot.
         // (2020/08/08)
